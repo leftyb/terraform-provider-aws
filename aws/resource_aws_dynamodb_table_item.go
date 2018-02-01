@@ -3,61 +3,48 @@ package aws
 import (
 	"fmt"
 	"log"
-	strings "strings"
+	"reflect"
+	"strings"
 	"time"
 
-	"github.com/hashicorp/terraform/helper/schema"
-
-	"bytes"
-	"encoding/json"
-	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
-	reflect "reflect"
+	"github.com/hashicorp/terraform/helper/resource"
+	"github.com/hashicorp/terraform/helper/schema"
 )
 
-// A number of these are marked as computed because if you don't
-// provide a value, DynamoDB will provide you with defaults (which are the
-// default values specified below)
 func resourceAwsDynamoDbTableItem() *schema.Resource {
 	return &schema.Resource{
 		Create: resourceAwsDynamoDbTableItemCreate,
 		Read:   resourceAwsDynamoDbTableItemRead,
 		Update: resourceAwsDynamoDbTableItemUpdate,
 		Delete: resourceAwsDynamoDbTableItemDelete,
+
 		Schema: map[string]*schema.Schema{
-			"table_name": &schema.Schema{
+			"table_name": {
 				Type:     schema.TypeString,
 				Required: true,
+				ForceNew: true,
 			},
-			"hash_key": &schema.Schema{
+			"hash_key": {
 				Type:     schema.TypeString,
 				Required: true,
+				ForceNew: true,
 			},
-			"item": &schema.Schema{
-				Type:     schema.TypeString,
-				Required: true,
-			},
-			"range_key": &schema.Schema{
+			"range_key": {
 				Type:     schema.TypeString,
 				Optional: true,
 			},
-			"query_key": &schema.Schema{
+			"item": {
 				Type:     schema.TypeString,
-				Computed: true,
+				Required: true,
 			},
-			"range_value": &schema.Schema{
-				Type:     schema.TypeString,
-				Computed: true,
-			},
-			"hash_value": &schema.Schema{
-				Type:     schema.TypeString,
-				Computed: true,
-			},
-			"consumed_capacity": &schema.Schema{
+
+			"consumed_capacity": {
 				Type:     schema.TypeFloat,
 				Computed: true,
 			},
-			"last_modified": &schema.Schema{
+			"last_modified": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
@@ -66,56 +53,207 @@ func resourceAwsDynamoDbTableItem() *schema.Resource {
 }
 
 func resourceAwsDynamoDbTableItemCreate(d *schema.ResourceData, meta interface{}) error {
-	dynamodbconn := meta.(*AWSClient).dynamodbconn
+	conn := meta.(*AWSClient).dynamodbconn
 
 	tableName := d.Get("table_name").(string)
 	hashKey := d.Get("hash_key").(string)
-	rangeKey := d.Get("range_key").(string)
-
-	log.Printf("[DEBUG] DynamoDB item create: %s", tableName)
-
 	item := d.Get("item").(string)
-
-	var av map[string]*dynamodb.AttributeValue
-
-	avDec := json.NewDecoder(strings.NewReader(item))
-
-	if err := avDec.Decode(&av); err != nil {
-		return fmt.Errorf("Error deserializing DynamoDB item JSON: %s", err)
-	}
-
-	exists := false
-	req := &dynamodb.PutItemInput{
-		Item: av,
-		Expected: map[string]*dynamodb.ExpectedAttributeValue{
-			hashKey: {
-				// Explode if item exists. We didn't create it.
-				Exists: &exists,
-			},
-		},
-		TableName: &tableName,
-	}
-
-	id := getId(tableName, hashKey, rangeKey, av)
-	err := retryLoop(func() error {
-		_, err := dynamodbconn.PutItem(req)
-
-		return err
-	}, fmt.Sprintf("creating DynamoDB table item '%s'", id))
-
+	attributes, err := expandDynamoDbTableItemAttributes(item)
 	if err != nil {
 		return err
 	}
 
-	setQueryKey(d, av, item, hashKey, rangeKey)
+	log.Printf("[DEBUG] DynamoDB item create: %s", tableName)
+
+	_, err = retryDynamoDbTableItemOperation(func() (interface{}, error) {
+		return conn.PutItem(&dynamodb.PutItemInput{
+			Item: attributes,
+			// Explode if item exists. We didn't create it.
+			Expected: map[string]*dynamodb.ExpectedAttributeValue{
+				hashKey: {
+					Exists: aws.Bool(false),
+				},
+			},
+			TableName: aws.String(tableName),
+		})
+	})
+	if err != nil {
+		return err
+	}
+
+	rangeKey := d.Get("range_key").(string)
+	id := buildDynamoDbTableItemId(tableName, hashKey, rangeKey, attributes)
 
 	d.SetId(id)
 
 	return resourceAwsDynamoDbTableItemRead(d, meta)
 }
 
-func getId(tableName string, hashKey string, rangeKey string, av map[string]*dynamodb.AttributeValue) string {
-	hashVal := av[hashKey]
+func resourceAwsDynamoDbTableItemUpdate(d *schema.ResourceData, meta interface{}) error {
+	log.Printf("[DEBUG] Updating DynamoDB table %s", d.Id())
+	conn := meta.(*AWSClient).dynamodbconn
+
+	if d.HasChange("item") {
+		tableName := d.Get("table_name").(string)
+		hashKey := d.Get("hash_key").(string)
+		rangeKey := d.Get("range_key").(string)
+		oldItem, newItem := d.GetChange("item")
+
+		attributes, err := expandDynamoDbTableItemAttributes(newItem.(string))
+		if err != nil {
+			return err
+		}
+		newQueryKey := buildDynamoDbTableItemQueryKey(attributes, hashKey, rangeKey)
+
+		updates := map[string]*dynamodb.AttributeValueUpdate{}
+		for k, v := range attributes {
+			// We shouldn't update the key values
+			skip := false
+			for qk := range newQueryKey {
+				if skip = (qk == k); skip {
+					break
+				}
+			}
+			if skip {
+				continue
+			}
+
+			updates[k] = &dynamodb.AttributeValueUpdate{
+				Action: aws.String("PUT"),
+				Value:  v,
+			}
+		}
+
+		_, err = retryDynamoDbTableItemOperation(func() (interface{}, error) {
+			return conn.UpdateItem(&dynamodb.UpdateItemInput{
+				AttributeUpdates: updates,
+				TableName:        aws.String(tableName),
+				Key:              newQueryKey,
+			})
+		})
+
+		if err != nil {
+			return err
+		}
+
+		// If we finished successfully, delete the old record if the query key is different
+		oItem := oldItem.(string)
+		item, err := expandDynamoDbTableItemAttributes(oItem)
+		if err != nil {
+			return err
+		}
+		oldQueryKey := buildDynamoDbTableItemQueryKey(item, hashKey, rangeKey)
+		if !reflect.DeepEqual(oldQueryKey, newQueryKey) {
+			_, err := retryDynamoDbTableItemOperation(func() (interface{}, error) {
+				return conn.DeleteItem(&dynamodb.DeleteItemInput{
+					Key:       oldQueryKey,
+					TableName: aws.String(tableName),
+				})
+			})
+			if err != nil {
+				return err
+			}
+		}
+
+		id := buildDynamoDbTableItemId(tableName, hashKey, rangeKey, attributes)
+		d.SetId(id)
+	}
+
+	return resourceAwsDynamoDbTableItemRead(d, meta)
+}
+
+func resourceAwsDynamoDbTableItemRead(d *schema.ResourceData, meta interface{}) error {
+	conn := meta.(*AWSClient).dynamodbconn
+
+	log.Printf("[DEBUG] Loading data for DynamoDB table item '%s'", d.Id())
+
+	tableName := d.Get("table_name").(string)
+	hashKey := d.Get("hash_key").(string)
+	rangeKey := d.Get("range_key").(string)
+	attributes, err := expandDynamoDbTableItemAttributes(d.Get("item").(string))
+	if err != nil {
+		return err
+	}
+
+	result, err := conn.GetItem(&dynamodb.GetItemInput{
+		TableName:                aws.String(tableName),
+		Key:                      buildDynamoDbTableItemQueryKey(attributes, hashKey, rangeKey),
+		ProjectionExpression:     buildDynamoDbProjectionExpression(attributes),
+		ExpressionAttributeNames: buildDynamoDbExpressionAttributeNames(attributes),
+	})
+	if err != nil {
+		if isAWSErr(err, dynamodb.ErrCodeResourceNotFoundException, "") {
+			log.Printf("[WARN] Dynamodb Table Item (%s) not found, error code (404)", d.Id())
+			d.SetId("")
+			return nil
+		}
+
+		return fmt.Errorf("Error retrieving DynamoDB table item: %s", err)
+	}
+
+	if result.Item == nil {
+		log.Printf("[WARN] Dynamodb Table Item (%s) not found", d.Id())
+		d.SetId("")
+		return nil
+	}
+
+	// The record exists, now test if it differs from what is desired
+	if !reflect.DeepEqual(result.Item, attributes) {
+		itemAttrs, err := flattenDynamoDbTableItemAttributes(result.Item)
+		if err != nil {
+			return err
+		}
+		d.Set("item", itemAttrs)
+		id := buildDynamoDbTableItemId(tableName, hashKey, rangeKey, result.Item)
+		d.SetId(id)
+	}
+
+	d.Set("consumed_capacity", result.ConsumedCapacity)
+
+	return nil
+}
+
+func resourceAwsDynamoDbTableItemDelete(d *schema.ResourceData, meta interface{}) error {
+	conn := meta.(*AWSClient).dynamodbconn
+
+	attributes, err := expandDynamoDbTableItemAttributes(d.Get("item").(string))
+	if err != nil {
+		return err
+	}
+	hashKey := d.Get("hash_key").(string)
+	rangeKey := d.Get("range_key").(string)
+	queryKey := buildDynamoDbTableItemQueryKey(attributes, hashKey, rangeKey)
+
+	_, err = retryDynamoDbTableItemOperation(func() (interface{}, error) {
+		return conn.DeleteItem(&dynamodb.DeleteItemInput{
+			Key:       queryKey,
+			TableName: aws.String(d.Get("table_name").(string)),
+		})
+	})
+	return err
+}
+
+// Helpers
+
+func buildDynamoDbExpressionAttributeNames(attrs map[string]*dynamodb.AttributeValue) map[string]*string {
+	names := map[string]*string{}
+	for key, _ := range attrs {
+		names["#a_"+key] = aws.String(key)
+	}
+
+	return names
+}
+
+func buildDynamoDbProjectionExpression(attrs map[string]*dynamodb.AttributeValue) *string {
+	keys := []string{}
+	for key, _ := range attrs {
+		keys = append(keys, key)
+	}
+	return aws.String("#a_" + strings.Join(keys, ", #a_"))
+}
+
+func buildDynamoDbTableItemId(tableName string, hashKey string, rangeKey string, attrs map[string]*dynamodb.AttributeValue) string {
+	hashVal := attrs[hashKey]
 
 	id := []string{
 		tableName,
@@ -134,7 +272,7 @@ func getId(tableName string, hashKey string, rangeKey string, av map[string]*dyn
 		id = append(id, "")
 	}
 	if rangeKey != "" {
-		rangeVal := av[rangeKey]
+		rangeVal := attrs[rangeKey]
 
 		id = append(id,
 			rangeKey,
@@ -158,307 +296,38 @@ func getId(tableName string, hashKey string, rangeKey string, av map[string]*dyn
 	return strings.Join(id, "|")
 }
 
-func resourceAwsDynamoDbTableItemUpdate(d *schema.ResourceData, meta interface{}) error {
-	log.Printf("[DEBUG] Updating DynamoDB table %s", d.Id())
-	dynamodbconn := meta.(*AWSClient).dynamodbconn
-
-	if d.HasChange("item") {
-		o, n := d.GetChange("item")
-
-		tableName := d.Get("table_name").(string)
-		hashKey := d.Get("hash_key").(string)
-		rangeKey := d.Get("range_key").(string)
-
-		newJson := n.(string)
-
-		var newItem map[string]*dynamodb.AttributeValue
-
-		newDec := json.NewDecoder(strings.NewReader(newJson))
-		if err := newDec.Decode(&newItem); err != nil {
-			return fmt.Errorf("Error deserializing DynamoDB item JSON: %s", err)
-		}
-
-		newQueryKey := getQueryKey(newItem, hashKey, rangeKey)
-
-		updates := map[string]*dynamodb.AttributeValueUpdate{}
-
-		for k, v := range newItem {
-			// We shouldn't update the key values
-			skip := false
-			for qk := range newQueryKey {
-				if skip = (qk == k); skip {
-					break
-				}
-			}
-			if skip {
-				continue
-			}
-
-			action := "PUT"
-			updates[k] = &dynamodb.AttributeValueUpdate{
-				Action: &action,
-				Value:  v,
-			}
-		}
-
-		req := dynamodb.UpdateItemInput{
-			AttributeUpdates: updates,
-			TableName:        &tableName,
-			Key:              newQueryKey,
-		}
-
-		err := retryLoop(func() error {
-			_, err := dynamodbconn.UpdateItem(&req)
-
-			return err
-		}, "updating DynamoDB table item '%s'")
-
-		if err != nil {
-			return err
-		}
-
-		// If we finished successfully, delete the old record if the query key is different
-		oldJson := o.(string)
-
-		var oldItem map[string]*dynamodb.AttributeValue
-
-		oldDec := json.NewDecoder(strings.NewReader(oldJson))
-		if err := oldDec.Decode(&oldItem); err != nil {
-			return fmt.Errorf("Error deserializing DynamoDB item JSON: %s", err)
-		}
-
-		oldQueryKey := getQueryKey(oldItem, hashKey, rangeKey)
-
-		id := getId(tableName, hashKey, rangeKey, newItem)
-
-		if !reflect.DeepEqual(oldQueryKey, newQueryKey) {
-			req := dynamodb.DeleteItemInput{
-				Key:       oldQueryKey,
-				TableName: &tableName,
-			}
-
-			err := retryLoop(func() error {
-				_, err := dynamodbconn.DeleteItem(&req)
-				return err
-			}, fmt.Sprintf("deleting old DynamoDB item '%s'", id))
-
-			if err != nil {
-				return err
-			}
-		}
-
-		setQueryKey(d, newItem, newJson, hashKey, rangeKey)
-
-		d.SetId(id)
-	}
-
-	return resourceAwsDynamoDbTableItemRead(d, meta)
-}
-
-func getQueryKey(av map[string]*dynamodb.AttributeValue, hashKey string, rangeKey string) map[string]*dynamodb.AttributeValue {
-	qk := map[string]*dynamodb.AttributeValue{}
+func buildDynamoDbTableItemQueryKey(attrs map[string]*dynamodb.AttributeValue, hashKey string, rangeKey string) map[string]*dynamodb.AttributeValue {
+	queryKey := map[string]*dynamodb.AttributeValue{}
 
 	flen := 1
 	if rangeKey != "" {
 		flen = 2
 	}
 
-	for k, v := range av {
+	for k, value := range attrs {
 		if k == hashKey || k == rangeKey {
-			qk[k] = v
+			queryKey[k] = value
 		}
-		if len(qk) == flen {
+		if len(queryKey) == flen {
 			break
 		}
 	}
 
-	return qk
+	return queryKey
 }
 
-func setQueryKey(d *schema.ResourceData, av map[string]*dynamodb.AttributeValue, item string, hashKey string, rangeKey string) {
-	var itemRaw map[string]json.RawMessage
-
-	hashDec := json.NewDecoder(strings.NewReader(item))
-	hashDec.Decode(&itemRaw)
-
-	keyRaw := map[string]json.RawMessage{}
-
-	hashRaw := itemRaw[hashKey]
-
-	keyRaw[hashKey] = hashRaw
-
-	hashBytes, _ := hashRaw.MarshalJSON()
-	d.Set("hash_value", string(hashBytes))
-
-	if rangeKey != "" {
-		rangeRaw := itemRaw[rangeKey]
-
-		keyRaw[rangeKey] = rangeRaw
-
-		rangeBytes, _ := rangeRaw.MarshalJSON()
-		d.Set("range_value", string(rangeBytes))
-	}
-
-	queryKeyBuf := bytes.NewBufferString("")
-	queryKeyEnc := json.NewEncoder(queryKeyBuf)
-	queryKeyEnc.Encode(keyRaw)
-
-	d.Set("query_key", queryKeyBuf.String())
-}
-
-func retryLoop(action func() error, actionDetails string) error {
-	attemptCount := 1
-	for attemptCount <= DYNAMODB_MAX_THROTTLE_RETRIES {
-		err := action()
-
+func retryDynamoDbTableItemOperation(f func() (interface{}, error)) (interface{}, error) {
+	var out interface{}
+	rErr := resource.Retry(1*time.Minute, func() *resource.RetryError {
+		var err error
+		out, err = f()
 		if err != nil {
-			if awsErr, ok := err.(awserr.Error); ok {
-				switch code := awsErr.Code(); code {
-				case "ThrottlingException":
-					log.Printf("[DEBUG] Attempt %d/%d: Sleeping for a bit to throttle back %s", attemptCount, DYNAMODB_MAX_THROTTLE_RETRIES, actionDetails)
-					time.Sleep(DYNAMODB_THROTTLE_SLEEP)
-					attemptCount += 1
-				case "LimitExceededException":
-					// If we're at resource capacity, error out without retry
-					if strings.Contains(awsErr.Message(), "Subscriber limit exceeded:") {
-						return fmt.Errorf("AWS Error %s: %s", actionDetails, err)
-					}
-					log.Printf("[DEBUG] Limit on concurrency of %s, sleeping for a bit", actionDetails)
-					time.Sleep(DYNAMODB_LIMIT_EXCEEDED_SLEEP)
-					attemptCount += 1
-				default:
-					// Some other non-retryable exception occurred
-					return fmt.Errorf("AWS Error %s: %s", actionDetails, err)
-				}
-			} else {
-				// Non-AWS exception occurred, give up
-				return fmt.Errorf("Error %s: %s", actionDetails, err)
+			if isAWSErr(err, dynamodb.ErrCodeLimitExceededException, "Subscriber limit exceeded:") {
+				return resource.RetryableError(err)
 			}
-		} else {
-			return nil
+			return resource.NonRetryableError(err)
 		}
-	}
-
-	// Too many throttling events occurred, give up
-	return fmt.Errorf("Failed %s after %d attempts", actionDetails, attemptCount)
-}
-
-func resourceAwsDynamoDbTableItemRead(d *schema.ResourceData, meta interface{}) error {
-	dynamodbconn := meta.(*AWSClient).dynamodbconn
-	log.Printf("[DEBUG] Loading data for DynamoDB table item '%s'", d.Id())
-
-	tableName := d.Get("table_name").(string)
-
-	// The record exists, now test if it differs from what is desired
-	item := d.Get("item").(string)
-	hashKey := d.Get("hash_key").(string)
-	rangeKey := d.Get("range_key").(string)
-
-	var av map[string]*dynamodb.AttributeValue
-	itemDec := json.NewDecoder(strings.NewReader(item))
-	itemDec.Decode(&av)
-
-	itemAttributes := []string{}
-	for k := range av {
-		itemAttributes = append(itemAttributes, k)
-	}
-
-	queryKey := getQueryKey(av, hashKey, rangeKey)
-
-	expressionAttributeNames := map[string]*string{}
-	projection := "#a_" + strings.Join(itemAttributes, ", #a_")
-
-	for _, v := range itemAttributes {
-		w := v
-		expressionAttributeNames["#a_"+v] = &w
-	}
-
-	req := dynamodb.GetItemInput{
-		TableName:                &tableName,
-		Key:                      queryKey,
-		ProjectionExpression:     &projection,
-		ExpressionAttributeNames: expressionAttributeNames,
-	}
-
-	result, err := dynamodbconn.GetItem(&req)
-
-	if err != nil {
-		if awsErr, ok := err.(awserr.Error); ok && awsErr.Code() == "ResourceNotFoundException" {
-			log.Printf("[WARN] Dynamodb Table Item (%s) not found, error code (404)", d.Id())
-			d.SetId("")
-			return nil
-		}
-
-		return fmt.Errorf("Error retrieving DynamoDB table item: %s %s", err, req)
-	}
-
-	// The record exists, now test if it differs from what is desired
-	if result.Item != nil && !reflect.DeepEqual(result.Item, av) {
-		buf := bytes.NewBufferString("")
-		enc := json.NewEncoder(buf)
-		enc.Encode(result.Item)
-
-		var itemRaw map[string]map[string]interface{}
-
-		// Reserialize so we get rid of the nulls
-		dec := json.NewDecoder(strings.NewReader(buf.String()))
-		dec.Decode(&itemRaw)
-
-		for _, val := range itemRaw {
-			for typeName, typeVal := range val {
-				if typeVal == nil {
-					delete(val, typeName)
-				}
-			}
-		}
-
-		rawBuf := bytes.NewBufferString("")
-		rawEnc := json.NewEncoder(rawBuf)
-		rawEnc.Encode(itemRaw)
-
-		d.Set("item", rawBuf.String())
-
-		id := getId(tableName, hashKey, rangeKey, result.Item)
-		d.SetId(id)
-	} else if result.Item == nil {
-		d.SetId("")
-	}
-
-	d.Set("consumed_capacity", result.ConsumedCapacity)
-
-	return nil
-}
-
-func resourceAwsDynamoDbTableItemDelete(d *schema.ResourceData, meta interface{}) error {
-	dynamodbconn := meta.(*AWSClient).dynamodbconn
-
-	tableName := d.Get("table_name").(string)
-
-	item := d.Get("item").(string)
-	hashKey := d.Get("hash_key").(string)
-	rangeKey := d.Get("range_key").(string)
-
-	var av map[string]*dynamodb.AttributeValue
-	itemDec := json.NewDecoder(strings.NewReader(item))
-	itemDec.Decode(&av)
-
-	queryKey := getQueryKey(av, hashKey, rangeKey)
-
-	req := dynamodb.DeleteItemInput{
-		Key:       queryKey,
-		TableName: &tableName,
-	}
-
-	err := retryLoop(func() error {
-		_, err := dynamodbconn.DeleteItem(&req)
-
-		return err
-	}, fmt.Sprintf("deleting DynamoDB table item '%s'", d.Id()))
-
-	if err != nil {
-		return err
-	}
-
-	d.SetId("")
-	return nil
+		return nil
+	})
+	return out, rErr
 }
